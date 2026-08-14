@@ -12,8 +12,7 @@ const (
 	VoteRejected VoteValue = "rejected"
 )
 
-// ChainVote is one directed response from the user's request to a request in
-// the next position of a candidate chain.
+// ChainVote — направленный отклик request -> target внутри цепочки.
 type ChainVote struct {
 	ChainID         int64
 	RequestID       int64

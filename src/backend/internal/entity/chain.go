@@ -50,8 +50,7 @@ type ChainParticipant struct {
 	CreatedAt              time.Time
 }
 
-// ReplacementOption is an active request from the declined participant's
-// cluster that can be invited to replace it without rebuilding the cycle.
+// ReplacementOption — ACTIVE из кластера отказавшегося; замена без пересборки цикла.
 type ReplacementOption struct {
 	RequestID         int64
 	OfferedItemID     int64

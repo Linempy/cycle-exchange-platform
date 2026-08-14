@@ -104,6 +104,9 @@ type fakeRepository struct {
 	proposed                []int64
 	proposalDeadline        time.Time
 	proposalExpired         bool
+	expiredChainIDs         []int64
+	expiredFrozenRequests   []int64
+	expiredFrozen           bool
 	upsertCalls             int
 	deleteCalls             int
 	markInProposal          int
@@ -125,6 +128,9 @@ type fakeRepository struct {
 	approvedCountCalls      int
 	confirmedRequestID      int64
 	confirmedTargetID       int64
+	unconfirmCalls          int
+	frozenReplacement       bool
+	preparedFrozen          bool
 	affectedChains          []int64
 	releasedRequests        []int64
 	thinkingCalls           int
@@ -140,6 +146,11 @@ type fakeRepository struct {
 	doneCalls               int
 	allDone                 bool
 	completeCalls           int
+	rankerCtx               ranker.ContextSnapshot
+}
+
+func (r *fakeRepository) HasDeadlineEvent(_ context.Context, _ string, _ int64) (bool, error) {
+	return false, nil
 }
 
 func (r *fakeRepository) SaveCandidates(_ context.Context, _ database.Tx, drafts []entity.ChainDraft) error {
@@ -199,6 +210,14 @@ func (r *fakeRepository) ExpireProposalIfDue(_ context.Context, _ database.Tx, _
 	return r.proposalExpired, nil
 }
 
+func (r *fakeRepository) ListExpiredChainIDs(_ context.Context, _ database.Tx) ([]int64, error) {
+	return append([]int64(nil), r.expiredChainIDs...), nil
+}
+
+func (r *fakeRepository) ExpireFrozenIfDue(_ context.Context, _ database.Tx, _ int64) ([]int64, bool, error) {
+	return append([]int64(nil), r.expiredFrozenRequests...), r.expiredFrozen, nil
+}
+
 func (r *fakeRepository) MarkRequestInProposal(_ context.Context, _ database.Tx, _ int64) error {
 	r.markInProposal++
 	return nil
@@ -211,6 +230,14 @@ func (r *fakeRepository) RestoreActiveIfNoPendingVotes(_ context.Context, _ data
 
 func (r *fakeRepository) LoadScoreFeatures(_ context.Context, _ database.Tx, _ int64) ([]float64, []float64, []int, error) {
 	return []float64{0.9, 0.9}, []float64{0.75, 0.75}, []int{1, 1}, nil
+}
+
+func (r *fakeRepository) LoadRankerContext(_ context.Context, _ database.Tx, _ int64) (ranker.ContextSnapshot, error) {
+	return r.rankerCtx, nil
+}
+
+func (r *fakeRepository) LoadRankerContextForRequests(_ context.Context, _ database.Tx, _ []int64) (ranker.ContextSnapshot, error) {
+	return r.rankerCtx, nil
 }
 
 func (r *fakeRepository) CountPendingVoters(_ context.Context, _ database.Tx, _ int64) (int, error) {
@@ -228,6 +255,21 @@ func (r *fakeRepository) ConfirmParticipant(_ context.Context, _ database.Tx, _,
 	r.confirmedRequestID = requestID
 	r.confirmedTargetID = targetID
 	return nil
+}
+
+func (r *fakeRepository) UnconfirmParticipant(_ context.Context, _ database.Tx, _ int64, _, _ int64) error {
+	r.unconfirmCalls++
+	return nil
+}
+
+func (r *fakeRepository) PrepareFrozenReplacement(_ context.Context, _ database.Tx, _ int64, _ time.Time) error {
+	r.status = entity.ChainStatusProposed
+	r.preparedFrozen = true
+	return nil
+}
+
+func (r *fakeRepository) IsFrozenReplacement(_ context.Context, _ database.Tx, _ int64) (bool, error) {
+	return r.frozenReplacement, nil
 }
 
 func (r *fakeRepository) MarkParticipantThinking(_ context.Context, _ database.Tx, _, _, _ int64) error {
@@ -285,6 +327,10 @@ func (r *fakeRepository) MarkItemsUnavailable(_ context.Context, _ database.Tx, 
 
 func (r *fakeRepository) LoadChainRequestIDs(_ context.Context, _ database.Tx, _ int64) ([]int64, error) {
 	return r.requestIDs, nil
+}
+
+func (r *fakeRepository) LoadActiveChainRequestIDs(ctx context.Context, tx database.Tx, chainID int64) ([]int64, error) {
+	return r.LoadChainRequestIDs(ctx, tx, chainID)
 }
 
 func (r *fakeRepository) LockRequestsForFreeze(_ context.Context, _ database.Tx, _ []int64) error {
@@ -372,6 +418,54 @@ func TestThinkRecordsExplicitDecision(t *testing.T) {
 	}
 }
 
+func TestUnconfirmReturnsApprovalToPending(t *testing.T) {
+	repository := &fakeRepository{
+		status: entity.ChainStatusProposed, length: 3,
+		edgeRequestID: 10, edgeTargetID: 20,
+	}
+	service := chainservice.NewService(repository, fakeTransactionManager{})
+
+	status, err := service.Unconfirm(context.Background(), "user-1", 7)
+	if err != nil {
+		t.Fatalf("Unconfirm() error = %v", err)
+	}
+	if status != entity.ChainStatusProposed || repository.unconfirmCalls != 1 {
+		t.Fatalf("Unconfirm() status = %s, calls = %d", status, repository.unconfirmCalls)
+	}
+}
+
+func TestUnconfirmDuringFrozenReplacementRollsBack(t *testing.T) {
+	repository := &fakeRepository{
+		status: entity.ChainStatusProposed, length: 3, frozenReplacement: true,
+		edgeRequestID: 10, edgeTargetID: 20,
+	}
+	service := chainservice.NewService(repository, fakeTransactionManager{})
+
+	status, err := service.Unconfirm(context.Background(), "user-1", 7)
+	if err != nil {
+		t.Fatalf("Unconfirm() error = %v", err)
+	}
+	if status != entity.ChainStatusCandidate || repository.unconfirmCalls != 0 {
+		t.Fatalf("Unconfirm() status = %s, direct calls = %d", status, repository.unconfirmCalls)
+	}
+}
+
+func TestDeclineFromFrozenStartsShortReplacementRound(t *testing.T) {
+	repository := &fakeRepository{
+		status: entity.ChainStatusFrozen, length: 3, approvedCount: 2,
+		edgeRequestID: 10, edgeTargetID: 20, declineAvailable: true,
+	}
+	service := chainservice.NewService(repository, fakeTransactionManager{})
+
+	available, status, err := service.Decline(context.Background(), "user-1", 7)
+	if err != nil {
+		t.Fatalf("Decline() error = %v", err)
+	}
+	if !available || status != entity.ChainStatusProposed || !repository.preparedFrozen {
+		t.Fatalf("Decline() available = %v, status = %s, prepared = %v", available, status, repository.preparedFrozen)
+	}
+}
+
 func TestDeclineKeepsProposalWhenReplacementExists(t *testing.T) {
 	repository := &fakeRepository{
 		status: entity.ChainStatusProposed, length: 3,
@@ -439,7 +533,8 @@ func TestDeclineRollsBackWhenReplacementMissing(t *testing.T) {
 
 func TestSelectReplacementPinsRequestedCandidate(t *testing.T) {
 	repository := &fakeRepository{status: entity.ChainStatusProposed, length: 3}
-	service := chainservice.NewService(repository, fakeTransactionManager{})
+	notifier := &fakeNotifier{}
+	service := chainservice.NewService(repository, fakeTransactionManager{}).WithNotifier(notifier)
 
 	if err := service.SelectReplacement(context.Background(), "user-1", 7, 99); err != nil {
 		t.Fatalf("SelectReplacement() error = %v", err)
@@ -447,6 +542,26 @@ func TestSelectReplacementPinsRequestedCandidate(t *testing.T) {
 	if repository.selectedRequestID != 99 {
 		t.Fatalf("selected request = %d, want 99", repository.selectedRequestID)
 	}
+	if notifier.invitedChainID != 7 || notifier.invitedRequestID != 99 {
+		t.Fatalf("replacement notification = chain %d request %d, want chain 7 request 99", notifier.invitedChainID, notifier.invitedRequestID)
+	}
+}
+
+type fakeNotifier struct {
+	frozenChainID    int64
+	invitedChainID   int64
+	invitedRequestID int64
+}
+
+func (n *fakeNotifier) NotifyChainFrozen(_ context.Context, chainID int64) error {
+	n.frozenChainID = chainID
+	return nil
+}
+
+func (n *fakeNotifier) NotifyReplacementInvited(_ context.Context, chainID, requestID int64) error {
+	n.invitedChainID = chainID
+	n.invitedRequestID = requestID
+	return nil
 }
 
 type fakeRebuilder struct {
@@ -462,6 +577,45 @@ func (r *fakeRebuilder) RepairAffectedChains(_ context.Context, _ database.Tx, a
 func (r *fakeRebuilder) RebuildRequests(_ context.Context, _ database.Tx, requestIDs []int64) error {
 	r.rebuilt = append([]int64(nil), requestIDs...)
 	return nil
+}
+
+func TestExpireDueRebuildsRequestsReleasedFromFrozenChain(t *testing.T) {
+	repository := &fakeRepository{
+		expiredChainIDs:       []int64{7},
+		expiredFrozen:         true,
+		expiredFrozenRequests: []int64{10, 20, 30},
+	}
+	rebuilder := &fakeRebuilder{}
+	freezer := chainservice.NewFreezeService(repository, rebuilder)
+
+	if err := freezer.ExpireDue(context.Background(), nil); err != nil {
+		t.Fatalf("ExpireDue() error = %v", err)
+	}
+	want := []int64{10, 20, 30}
+	if len(rebuilder.rebuilt) != len(want) {
+		t.Fatalf("rebuilt = %v, want %v", rebuilder.rebuilt, want)
+	}
+	for i := range want {
+		if rebuilder.rebuilt[i] != want[i] {
+			t.Fatalf("rebuilt = %v, want %v", rebuilder.rebuilt, want)
+		}
+	}
+}
+
+func TestExpireDueDoesNotRebuildRolledBackProposal(t *testing.T) {
+	repository := &fakeRepository{
+		expiredChainIDs: []int64{7},
+		proposalExpired: true,
+	}
+	rebuilder := &fakeRebuilder{}
+	freezer := chainservice.NewFreezeService(repository, rebuilder)
+
+	if err := freezer.ExpireDue(context.Background(), nil); err != nil {
+		t.Fatalf("ExpireDue() error = %v", err)
+	}
+	if len(rebuilder.rebuilt) != 0 {
+		t.Fatalf("rebuilt = %v, want none", rebuilder.rebuilt)
+	}
 }
 
 func TestConfirmKeepsProposedUntilEveryParticipantApproves(t *testing.T) {
@@ -494,6 +648,67 @@ func TestConfirmKeepsProposedUntilEveryParticipantApproves(t *testing.T) {
 	}
 }
 
+func TestProdChainStateFilled(t *testing.T) {
+	created := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	stage := created.Add(2 * time.Hour)
+	repository := &fakeRepository{
+		status:        entity.ChainStatusProposed,
+		length:        3,
+		approvedCount: 1,
+		requestIDs:    []int64{10, 20, 30},
+		edgeRequestID: 10,
+		edgeTargetID:  20,
+		rankerCtx: ranker.ContextSnapshot{
+			CreatedAt:         created,
+			StageEnteredAt:    stage,
+			VoteTimes:         []time.Time{stage},
+			OfferedCategories: []string{"phones", "laptops", "cameras"},
+			WantedCategories:  []string{"laptops", "cameras", "phones"},
+			CategoryCounts:    map[string]int{"phones": 20, "laptops": 10, "cameras": 5},
+			CategoryTotal:     80,
+		},
+	}
+	cap := &capturingRanker{inner: ranker.NewFormulaRanker(ranker.NewRankerConfig())}
+	service := chainservice.NewService(repository, fakeTransactionManager{}).WithScorer(cap)
+
+	if _, err := service.Confirm(context.Background(), "user-1", 7); err != nil {
+		t.Fatalf("Confirm() error = %v", err)
+	}
+	got := cap.last
+	if got.CreatedAt.IsZero() || got.StageEnteredAt.IsZero() {
+		t.Fatalf("refreshScore timestamps zero: created=%v stage=%v", got.CreatedAt, got.StageEnteredAt)
+	}
+	if !got.CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt = %v, want %v", got.CreatedAt, created)
+	}
+	if len(got.OfferedCategories) == 0 || got.OfferedCategories[0] == "" {
+		t.Fatalf("offered categories empty: %v", got.OfferedCategories)
+	}
+	if len(got.WantedCategories) == 0 || got.WantedCategories[0] == "" {
+		t.Fatalf("wanted categories empty: %v", got.WantedCategories)
+	}
+	feats, err := ranker.ExtractMLFeatures(got, ranker.NewRankerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if feats["hours_since_created"] <= 0 {
+		t.Fatalf("hours_since_created = %v, want > 0", feats["hours_since_created"])
+	}
+	if feats["category_popularity"] <= 0 {
+		t.Fatalf("category_popularity = %v, want > 0", feats["category_popularity"])
+	}
+}
+
+type capturingRanker struct {
+	inner ranker.Ranker
+	last  ranker.ChainState
+}
+
+func (c *capturingRanker) Score(s ranker.ChainState) (float64, error) {
+	c.last = s
+	return c.inner.Score(s)
+}
+
 func TestConfirmFreezesWhenEveryParticipantApproved(t *testing.T) {
 	repository := &fakeRepository{
 		status:        entity.ChainStatusProposed,
@@ -507,7 +722,8 @@ func TestConfirmFreezesWhenEveryParticipantApproved(t *testing.T) {
 	repository.affectedChains = []int64{8, 9}
 	repository.releasedRequests = []int64{30, 40}
 	freezer := chainservice.NewFreezeService(repository, rebuilder)
-	service := chainservice.NewService(repository, fakeTransactionManager{}).WithFreezer(freezer)
+	notifier := &fakeNotifier{}
+	service := chainservice.NewService(repository, fakeTransactionManager{}).WithFreezer(freezer).WithNotifier(notifier)
 
 	status, err := service.Confirm(context.Background(), "user-1", 7)
 	if err != nil {
@@ -527,6 +743,9 @@ func TestConfirmFreezesWhenEveryParticipantApproved(t *testing.T) {
 	}
 	if len(rebuilder.rebuilt) != 2 || rebuilder.rebuilt[0] != 30 || rebuilder.rebuilt[1] != 40 {
 		t.Fatalf("rebuilt released requests = %v, want [30 40]", rebuilder.rebuilt)
+	}
+	if notifier.frozenChainID != 7 {
+		t.Fatalf("frozen notification chain = %d, want 7", notifier.frozenChainID)
 	}
 }
 
@@ -580,7 +799,8 @@ func TestConfirmFrozenRetryIsIdempotentForParticipant(t *testing.T) {
 		edgeRequestID: 10,
 		edgeTargetID:  20,
 	}
-	service := chainservice.NewService(repository, fakeTransactionManager{})
+	notifier := &fakeNotifier{}
+	service := chainservice.NewService(repository, fakeTransactionManager{}).WithNotifier(notifier)
 
 	status, err := service.Confirm(context.Background(), "user-1", 7)
 	if err != nil {
@@ -591,6 +811,9 @@ func TestConfirmFrozenRetryIsIdempotentForParticipant(t *testing.T) {
 	}
 	if repository.lockRequestCalls != 0 || repository.freezeCalled {
 		t.Fatal("idempotent retry must not repeat locking or freezing")
+	}
+	if notifier.frozenChainID != 0 {
+		t.Fatal("idempotent retry must not repeat the frozen notification")
 	}
 }
 

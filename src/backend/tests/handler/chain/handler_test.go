@@ -161,22 +161,27 @@ func TestExchangeOptionsReturnsOnlyNextClusterMembers(t *testing.T) {
 }
 
 type fakeService struct {
-	chain            entity.Chain
-	chains           []entity.Chain
-	vote             entity.ChainVote
-	voteInput        chainservice.VoteInput
-	withdrawInput    chainservice.VoteInput
-	confirmStatus    entity.ChainStatus
-	confirmUserID    string
-	confirmChainID   int64
-	handoffResult    chainservice.FulfillmentResult
-	receiptResult    chainservice.FulfillmentResult
-	handoffChainID   int64
-	handoffRequestID int64
-	receiptUserID    string
-	receiptChainID   int64
-	receiptRequestID int64
-	err              error
+	chain                 entity.Chain
+	chains                []entity.Chain
+	vote                  entity.ChainVote
+	voteInput             chainservice.VoteInput
+	withdrawInput         chainservice.VoteInput
+	confirmStatus         entity.ChainStatus
+	confirmUserID         string
+	confirmChainID        int64
+	handoffResult         chainservice.FulfillmentResult
+	receiptResult         chainservice.FulfillmentResult
+	handoffChainID        int64
+	handoffRequestID      int64
+	receiptUserID         string
+	receiptChainID        int64
+	receiptRequestID      int64
+	declineAvailable      bool
+	declineStatus         entity.ChainStatus
+	replacements          []entity.ReplacementOption
+	selectChainID         int64
+	selectedReplacementID int64
+	err                   error
 }
 
 func (s *fakeService) Confirm(_ context.Context, userID string, chainID int64) (entity.ChainStatus, error) {
@@ -185,17 +190,29 @@ func (s *fakeService) Confirm(_ context.Context, userID string, chainID int64) (
 	return s.confirmStatus, s.err
 }
 
+func (s *fakeService) Unconfirm(_ context.Context, _ string, _ int64) (entity.ChainStatus, error) {
+	return entity.ChainStatusProposed, s.err
+}
+
 func (s *fakeService) Think(_ context.Context, _ string, _ int64) error { return s.err }
 
 func (s *fakeService) Decline(_ context.Context, _ string, _ int64) (bool, entity.ChainStatus, error) {
-	return false, entity.ChainStatusCandidate, s.err
+	status := s.declineStatus
+	if status == "" {
+		status = entity.ChainStatusCandidate
+	}
+	return s.declineAvailable, status, s.err
 }
 
 func (s *fakeService) ListReplacements(_ context.Context, _ string, _ int64) ([]entity.ReplacementOption, error) {
-	return nil, s.err
+	return s.replacements, s.err
 }
 
-func (s *fakeService) SelectReplacement(_ context.Context, _ string, _, _ int64) error { return s.err }
+func (s *fakeService) SelectReplacement(_ context.Context, _ string, chainID, requestID int64) error {
+	s.selectChainID = chainID
+	s.selectedReplacementID = requestID
+	return s.err
+}
 
 func (s *fakeService) Handoff(_ context.Context, chainID, requestID int64) (chainservice.FulfillmentResult, error) {
 	s.handoffChainID = chainID

@@ -167,6 +167,10 @@ func (c *fakeChains) ListChainsContainingRequest(_ context.Context, _ database.T
 func (c *fakeChains) LoadChainRequestIDs(_ context.Context, _ database.Tx, chainID int64) ([]int64, error) {
 	return c.requestIDsByChain[chainID], nil
 }
+
+func (c *fakeChains) LoadActiveChainRequestIDs(ctx context.Context, tx database.Tx, chainID int64) ([]int64, error) {
+	return c.LoadChainRequestIDs(ctx, tx, chainID)
+}
 func (c *fakeChains) DeleteRequestParticipation(_ context.Context, _ database.Tx, _ int64) error {
 	return nil
 }

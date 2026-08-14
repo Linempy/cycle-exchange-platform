@@ -4,16 +4,17 @@
 
 Моя зона ответственности — жизненный цикл заявок на обмен, кластеризация похожих заявок, поиск циклических вариантов обмена, отклики пользователей, мягкая блокировка цепочек и подбор замены при отказе участника.
 
-> Некоторые файлы являются интеграционными: в них есть код, написанный до моей доработки. Они включены только там, где содержат реализованную мной бизнес-логику. Основные самостоятельные реализации и тесты находятся в `src/backend/internal/service/matching`, `src/backend/internal/service/cluster`, `src/backend/internal/service/exchange_offer` и `src/backend/tests`.
+> В репозитории представлена актуальная версия реализованной мной бизнес-логики. Позднее часть крупных файлов была совместно отрефакторена другим участником команды: код разделили по зонам ответственности, унифицировали интерфейсы и привели к общему стилю проекта. Самостоятельные компоненты других участников сюда не переносились; совместно отрефакторенные файлы включены только там, где продолжают содержать описанную ниже мою логику.
 
 ## Содержание
 
 - [`src/backend/internal/service/exchange_offer`](src/backend/internal/service/exchange_offer) — CRUD заявок на обмен и интеграция с matching.
 - [`src/backend/internal/service/cluster`](src/backend/internal/service/cluster) — формирование и обновление кластеров похожих заявок.
 - [`src/backend/internal/service/matching`](src/backend/internal/service/matching) — поиск кандидатов, DFS-поиск циклов и валидация цепочек.
-- [`src/backend/internal/service/chain`](src/backend/internal/service/chain) — отклики, переход в `PROPOSED`, откат и быстрая замена.
+- [`src/backend/internal/service/chain`](src/backend/internal/service/chain) — отклики, переход в `PROPOSED`, дедлайны, откат и быстрая замена.
+- [`src/backend/internal/infrastructure/chainnotification`](src/backend/internal/infrastructure/chainnotification) — уведомления о заморозке, замене и завершении цепочки по дедлайну.
 - [`src/backend/tests`](src/backend/tests) — unit- и handler-тесты основной логики.
-- [`src/backend/migrations`](src/backend/migrations) — SQL-миграции для направленных голосов и статуса ожидания.
+- [`src/backend/migrations`](src/backend/migrations) — SQL-миграции для направленных голосов, попыток замены и событий дедлайна.
 
 ## 1. CRUD заявок на обмен
 
@@ -33,8 +34,8 @@
 
 - [сервис заявок](src/backend/internal/service/exchange_offer/service.go);
 - [контракты сервиса](src/backend/internal/service/exchange_offer/contracts.go);
-- [репозиторий](src/backend/internal/repository/exchange_offer/repository.go);
-- [HTTP-обработчик](src/backend/internal/handler/exchange_offer/handler.go);
+- [репозиторий](src/backend/internal/repository/exchange_offer);
+- [HTTP-обработчики](src/backend/internal/handler/exchange_offer);
 - [тесты сервиса](src/backend/tests/service/exchange_offer/service_test.go).
 
 ## 2. Кластеризация похожих заявок
@@ -61,13 +62,13 @@
 
 - [сервис кластеризации](src/backend/internal/service/cluster/service.go);
 - [контракты кластеризации](src/backend/internal/service/cluster/contracts.go);
-- [доступ к кластерам](src/backend/internal/repository/cluster/repository.go);
+- [доступ к кластерам](src/backend/internal/repository/cluster);
 - [векторный поиск кандидатов](src/backend/internal/repository/search/repository.go);
 - [тесты кластеризации](src/backend/tests/service/cluster/service_test.go).
 
 ## 3. Поиск циклических цепочек
 
-Реализовал `CycleFinder` на DFS для поиска простых циклов обмена длиной от 2 до 5 участников.
+Реализовал `CycleFinder` на DFS для поиска простых циклов обмена длиной от 2 до 5 позиций-кластеров.
 
 Направление `A → B` означает, что участник A передаёт свой товар участнику B. Цикл валиден, когда каждый участник получает желаемый товар от предыдущего участника:
 
@@ -79,14 +80,14 @@ A → B → C → A
 
 Алгоритм:
 
-1. Для новой или обновлённой заявки загружаются Top-K подходящих исходящих рёбер.
-2. Из них строится локальный ориентированный граф.
-3. DFS ищет простые циклы с ограничением длины.
-4. Для найденного цикла создаётся `ChainDraft`.
-5. Кандидат проходит проверки направления, категорий, порогов similarity и уникальности пути.
-6. Валидные варианты сохраняются как `CANDIDATE` и дедуплицируются по сигнатуре кластеров.
+1. Поиск стартует от кластера новой или изменённой заявки.
+2. Для заявок этого кластера загружаются Top-K совместимых заявок: отдаваемый товар кандидата должен соответствовать желанию текущей позиции.
+3. Каждая найденная заявка переводится в её `cluster_id`, поэтому вершиной итогового маршрута является кластер, а заявка служит конкретным подтверждением существования ребра между двумя кластерами.
+4. DFS обходит такие переходы и ищет замыкание в стартовый кластер, не допуская повторения кластера, заявки или владельца внутри пути.
+5. Для цикла длиной 2–5 создаётся `ChainDraft`, который проходит проверки направления, категорий и качества связей.
+6. Валидный маршрут сохраняется как `CANDIDATE` и дедуплицируется по упорядоченной сигнатуре кластеров.
 
-Почему поиск ведётся по кластерам: при нескольких похожих заявках на каждой позиции один и тот же смысловой маршрут превращается в набор почти одинаковых комбинаций конкретных заявок. Кластер позволяет найти маршрут один раз, а конкретного участника выбрать позднее голосованием. Поэтому на этапе подбора достаточно найти корректный цикл совместимых кластеров.
+Таким образом, DFS технически получает соседей через конкретные заявки, потому что именно у них хранятся товары, желания и embeddings. Но путь, который становится цепочкой, формируется из кластеров. Несколько взаимозаменяемых заявок внутри одного кластера не создают несколько одинаковых маршрутов: конкретный участник фиксируется позднее направленным откликом.
 
 Код:
 
@@ -121,8 +122,8 @@ A → B → C → A
 Код:
 
 - [сервис цепочек](src/backend/internal/service/chain/service.go);
-- [репозиторий цепочек и голосов](src/backend/internal/repository/chain/repository.go);
-- [HTTP API цепочек](src/backend/internal/handler/chain/handler.go);
+- [репозитории цепочек и голосов](src/backend/internal/repository/chain);
+- [HTTP API цепочек](src/backend/internal/handler/chain);
 - [сущность голоса](src/backend/internal/entity/vote.go);
 - [миграция направленных голосов](src/backend/migrations/000008_add_vote_targets.up.sql);
 - [тесты цепочек](src/backend/tests/service/chain/service_test.go).
@@ -137,12 +138,17 @@ A → B → C → A
 
 Почему замена не выбирается автоматически: similarity показывает техническую совместимость, но не заменяет согласие пользователя. Автоматическая подстановка могла бы вовлечь человека в сделку, которую он не видел и не подтверждал.
 
+Дополнительно реализованы дедлайны и восстановление согласованного состояния. Истёкшая цепочка атомарно распадается, зависшие заявки возвращаются в доступный статус, а участники получают уведомление с причиной завершения. Отмена подтверждения до жёсткой блокировки возвращает голос в `pending`, не создавая новую сущность.
+
 Код:
 
-- [логика цепочек, включая rollback и replacement](src/backend/internal/service/chain/service.go);
+- [логика цепочек, включая rollback, deadlines и replacement](src/backend/internal/service/chain);
 - [контракты цепочек](src/backend/internal/service/chain/contracts.go);
-- [API выбора замены](src/backend/internal/handler/chain/handler.go);
+- [API выбора замены](src/backend/internal/handler/chain);
 - [миграция статуса ожидания](src/backend/migrations/000014_add_thinking_vote.up.sql).
+- [миграция попыток замены](src/backend/migrations/000015_add_replacement_attempts.up.sql);
+- [миграция событий дедлайна](src/backend/migrations/000016_add_chain_deadline_events.up.sql);
+- [почтовые уведомления цепочки](src/backend/internal/infrastructure/chainnotification/notifier.go).
 
 ## Технические решения
 

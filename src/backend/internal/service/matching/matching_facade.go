@@ -2,12 +2,18 @@ package matching
 
 import (
 	"context"
+	"time"
 
 	"github.com/Avito-Team-Not-Found/tricky-exchanger/internal/core/database"
 	"github.com/Avito-Team-Not-Found/tricky-exchanger/internal/entity"
 
 	"github.com/Avito-Team-Not-Found/tricky-exchanger/pkg/utils/ranker"
 )
+
+// RankerContextLoader подгружает времена и категории заявок для ChainState (ADD).
+type RankerContextLoader interface {
+	LoadRankerContextForRequests(ctx context.Context, tx database.Tx, requestIDs []int64) (ranker.ContextSnapshot, error)
+}
 
 // ClusterSynchronizer описывает часть matching, отвечающую за актуальное
 // членство заявки в кластере.
@@ -26,6 +32,7 @@ type CycleSearcher interface {
 type ChainLifecycle interface {
 	SaveCandidates(ctx context.Context, tx database.Tx, drafts []entity.ChainDraft) error
 	LoadChainRequestIDs(ctx context.Context, tx database.Tx, chainID int64) ([]int64, error)
+	LoadActiveChainRequestIDs(ctx context.Context, tx database.Tx, chainID int64) ([]int64, error)
 	ListChainsContainingRequest(ctx context.Context, tx database.Tx, requestID int64) ([]int64, error)
 	DeleteRequestParticipation(ctx context.Context, tx database.Tx, requestID int64) error
 	DeleteChain(ctx context.Context, tx database.Tx, chainID int64) error
@@ -33,14 +40,20 @@ type ChainLifecycle interface {
 
 // MatchingFacade связывает CRUD заявок с кластеризацией и поиском вариантов цепочек.
 type MatchingFacade struct {
-	clusters ClusterSynchronizer
-	cycles   CycleSearcher
-	chains   ChainLifecycle
-	ranker   *ranker.ChainScoreCalculator
+	clusters  ClusterSynchronizer
+	cycles    CycleSearcher
+	chains    ChainLifecycle
+	ranker    ranker.Ranker
+	ctxLoader RankerContextLoader
 }
 
-func (f *MatchingFacade) WithRanker(r *ranker.ChainScoreCalculator) *MatchingFacade {
+func (f *MatchingFacade) WithRanker(r ranker.Ranker) *MatchingFacade {
 	f.ranker = r
+	return f
+}
+
+func (f *MatchingFacade) WithRankerContextLoader(loader RankerContextLoader) *MatchingFacade {
+	f.ctxLoader = loader
 	return f
 }
 
@@ -130,7 +143,11 @@ func (f *MatchingFacade) findAndSaveCandidates(
 			return nil, entity.ErrScoreNotConfigured
 		}
 		for i := range drafts {
-			score, err := f.ranker.Score(chainStateFromDraft(drafts[i]))
+			state, err := f.chainStateFromDraft(ctx, tx, drafts[i])
+			if err != nil {
+				return nil, err
+			}
+			score, err := f.ranker.Score(state)
 			if err != nil {
 				return nil, err
 			}
@@ -193,7 +210,7 @@ func (f *MatchingFacade) RemoveRequest(ctx context.Context, tx database.Tx, requ
 // оставшегося участника каждой, либо удаляет опустевшие.
 func (f *MatchingFacade) RepairAffectedChains(ctx context.Context, tx database.Tx, affected []int64) error {
 	for _, chainID := range affected {
-		requestIDs, err := f.chains.LoadChainRequestIDs(ctx, tx, chainID)
+		requestIDs, err := f.chains.LoadActiveChainRequestIDs(ctx, tx, chainID)
 		if err != nil {
 			return err
 		}
@@ -204,7 +221,7 @@ func (f *MatchingFacade) RepairAffectedChains(ctx context.Context, tx database.T
 		if len(requestIDs) == 0 {
 			continue
 		}
-		// Новый круг поиска от первого оставшегося участника.
+		// Новый круг поиска от первого оставшегося активного участника.
 		if _, err := f.RebuildForRequest(ctx, tx, requestIDs[0]); err != nil {
 			return err
 		}
@@ -230,8 +247,12 @@ func (f *MatchingFacade) RebuildRequests(ctx context.Context, tx database.Tx, re
 	return nil
 }
 
-func chainStateFromDraft(draft entity.ChainDraft) ranker.ChainState {
-	return ranker.ChainState{
+func (f *MatchingFacade) chainStateFromDraft(
+	ctx context.Context,
+	tx database.Tx,
+	draft entity.ChainDraft,
+) (ranker.ChainState, error) {
+	state := ranker.ChainState{
 		Count:                   len(draft.Participants),
 		Stage:                   ranker.ChainStateCandidate,
 		Event:                   ranker.EventAdd,
@@ -240,4 +261,18 @@ func chainStateFromDraft(draft entity.ChainDraft) ranker.ChainState {
 		ParticipantClusterSizes: draft.ClusterSizes,
 		ApprovedVotes:           0,
 	}
+	if f.ctxLoader == nil {
+		return state, nil
+	}
+	ids := make([]int64, len(draft.Participants))
+	for i, p := range draft.Participants {
+		ids[i] = p.RequestID
+	}
+	snap, err := f.ctxLoader.LoadRankerContextForRequests(ctx, tx, ids)
+	if err != nil {
+		return ranker.ChainState{}, err
+	}
+	state = ranker.ApplyContext(state, snap, time.Now())
+	ranker.LogSparseChainState(state)
+	return state, nil
 }

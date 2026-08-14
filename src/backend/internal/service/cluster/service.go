@@ -14,7 +14,6 @@ const (
 	defaultDirectionMargin = 0.05
 )
 
-// Service определяет, в какой кластер должно попасть предложение.
 type Service struct {
 	repository      Repository
 	searcher        CandidateSearcher
@@ -23,7 +22,6 @@ type Service struct {
 	directionMargin float64
 }
 
-// NewService создаёт сервис кластеризации.
 func NewService(repository Repository, searcher CandidateSearcher, topK int, threshold, directionMargin float64) *Service {
 	if topK <= 0 {
 		topK = defaultTopK
@@ -43,8 +41,7 @@ func NewService(repository Repository, searcher CandidateSearcher, topK int, thr
 	}
 }
 
-// Synchronize удаляет старое членство предложения и добавляет его в кластер,
-// найденный по embeddings отдаваемого и желаемого товаров.
+// Synchronize — сменить membership; advisory xact lock сериализует перестройку кластеров.
 func (s *Service) Synchronize(ctx context.Context, tx database.Tx, offerID int64) error {
 	if s.repository == nil || s.searcher == nil {
 		return entity.ErrClusterNotConfigured
@@ -105,6 +102,10 @@ func (s *Service) Synchronize(ctx context.Context, tx database.Tx, offerID int64
 			return err
 		}
 		clusterID = &createdID
+	} else if err := s.repository.ConsolidateCandidateClusters(
+		ctx, tx, *clusterID, candidateIDs, vectors, s.threshold, s.directionMargin,
+	); err != nil {
+		return err
 	}
 
 	if err := s.repository.AddMember(ctx, tx, *clusterID, offerID); err != nil {
@@ -126,8 +127,6 @@ func (s *Service) Remove(ctx context.Context, tx database.Tx, offerID int64) err
 	return s.repository.Refresh(ctx, tx, *clusterID)
 }
 
-// ListActiveMembers возвращает реальные ACTIVE-предложения кластера для
-// дальнейшей проверки совместимости сервисами цепочек и замен.
 func (s *Service) ListActiveMembers(ctx context.Context, clusterID int64) ([]entity.ExchangeOffer, error) {
 	return s.repository.ListActiveMembers(ctx, clusterID)
 }

@@ -136,6 +136,18 @@ func (r *fakeRepository) FindClusterForCandidates(
 	return r.candidateID, nil
 }
 
+func (r *fakeRepository) ConsolidateCandidateClusters(
+	context.Context,
+	database.Tx,
+	int64,
+	[]int64,
+	clusterservice.OfferVectors,
+	float64,
+	float64,
+) error {
+	return nil
+}
+
 func (r *fakeRepository) Create(context.Context, database.Tx) (int64, error) {
 	r.created++
 	return 7, nil

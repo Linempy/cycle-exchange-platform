@@ -27,6 +27,15 @@ type Repository interface {
 		threshold float64,
 		directionMargin float64,
 	) (*int64, error)
+	ConsolidateCandidateClusters(
+		ctx context.Context,
+		tx database.Tx,
+		targetClusterID int64,
+		offerIDs []int64,
+		vectors OfferVectors,
+		threshold float64,
+		directionMargin float64,
+	) error
 	Create(ctx context.Context, tx database.Tx) (int64, error)
 	AddMember(ctx context.Context, tx database.Tx, clusterID, offerID int64) error
 	Refresh(ctx context.Context, tx database.Tx, clusterID int64) error
